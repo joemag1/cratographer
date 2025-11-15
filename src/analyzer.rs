@@ -21,8 +21,6 @@ pub enum AnalyzerError {
     IoError(std::io::Error),
     /// Canceled operation
     Canceled,
-    /// Other errors
-    Other(String),
 }
 
 impl std::fmt::Display for AnalyzerError {
@@ -112,10 +110,10 @@ impl Analyzer {
         let analysis = self.host.analysis();
 
         // Use symbol_search to find all symbols matching the name
-        // Limit to 1000 results
+        // Limit to 100 results
         let symbols = analysis.symbol_search(
             ra_ap_ide::Query::new(name.to_string()),
-            1000
+            100
         ).map_err(|_| AnalyzerError::Canceled)?;
 
         // Convert to our SymbolInfo type
@@ -302,8 +300,8 @@ mod tests {
             symbols
         );
 
-        if let Some(sym) = analyzer_struct {
-            println!("Found Analyzer struct at {}:{}:{}", sym.file_path, sym.line, sym.column);
+        for sym in symbols.iter() {
+            println!("Found Analyzer: {:?}", sym);
         }
     }
 
@@ -333,8 +331,8 @@ mod tests {
             symbols
         );
 
-        if let Some(sym) = server_struct {
-            println!("Found CratographerServer at {}:{}:{}", sym.file_path, sym.line, sym.column);
+        for sym in symbols.iter() {
+            println!("Found AnalyzerServer: {:?}", sym);
         }
     }
 }
