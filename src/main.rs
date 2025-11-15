@@ -1,35 +1,120 @@
 mod analyzer;
 
+use analyzer::{Analyzer, SearchMode, SearchOptions};
 use rmcp::{
-    handler::server::router::tool::ToolRouter,
-    model::{CallToolResult, Content, ErrorData as McpError, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
+    handler::server::{
+        router::tool::ToolRouter,
+        wrapper::Parameters,
+    },
+    model::{CallToolResult, Content, ErrorCode, ErrorData as McpError, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router, ServerHandler, ServiceExt,
     transport::stdio,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::sync::{Arc, Mutex};
+
+/// Parameters for the find_symbol tool
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct FindSymbolParams {
+    /// The name of the symbol to search for
+    name: String,
+    /// Search mode: "exact", "fuzzy", or "prefix" (default: "fuzzy")
+    #[serde(default)]
+    mode: Option<String>,
+    /// Whether to include library symbols in the search (default: false)
+    #[serde(default)]
+    include_library: Option<bool>,
+    /// Whether to search only for type symbols (structs, enums, traits) (default: false)
+    #[serde(default)]
+    types_only: Option<bool>,
+}
 
 /// Cratographer MCP Server
 /// Provides tools for indexing and querying Rust code symbols
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CratographerServer {
     tool_router: ToolRouter<Self>,
+    analyzer: Arc<Mutex<Analyzer>>,
 }
 
 #[tool_router]
 impl CratographerServer {
-    fn new() -> Self {
-        Self {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        // Initialize the analyzer and load the current project
+        let mut analyzer = Analyzer::new();
+
+        // Load the current directory as the project
+        // Fail initialization if project loading fails
+        analyzer.load_project(".")?;
+
+        Ok(Self {
             tool_router: Self::tool_router(),
-        }
+            analyzer: Arc::new(Mutex::new(analyzer)),
+        })
     }
 
     /// Find all occurrences of a symbol by name across the indexed codebase
-    /// TODO: Expose search mode, include_library, and types_only parameters via MCP
     #[tool(description = "Find all occurrences of a Rust symbol (struct, enum, trait, function, method) by name")]
-    async fn find_symbol(&self) -> Result<CallToolResult, McpError> {
-        // Placeholder - will be implemented with actual analyzer integration
-        Ok(CallToolResult::success(vec![Content::text(
-            "find_symbol tool - search parameters (mode, include_library, types_only) added to analyzer API".to_string()
-        )]))
+    async fn find_symbol(&self, params: Parameters<FindSymbolParams>) -> Result<CallToolResult, McpError> {
+        let params = params.0;
+
+        // Parse search mode from string
+        let mode = match params.mode.as_deref() {
+            Some("exact") => SearchMode::Exact,
+            Some("prefix") => SearchMode::Prefix,
+            Some("fuzzy") | None => SearchMode::Fuzzy,
+            Some(other) => {
+                return Err(McpError {
+                    code: ErrorCode(-1),
+                    message: format!("Invalid search mode: '{}'. Valid values: 'exact', 'fuzzy', 'prefix'", other).into(),
+                    data: None,
+                });
+            }
+        };
+
+        // Build search options from parameters
+        let options = SearchOptions {
+            mode,
+            include_library: params.include_library.unwrap_or(false),
+            types_only: params.types_only.unwrap_or(false),
+        };
+
+        // Perform the search (lock the analyzer)
+        let analyzer = self.analyzer.lock().unwrap();
+        let results = analyzer.find_symbol(&params.name, &options)
+            .map_err(|e| McpError {
+                code: ErrorCode(-1),
+                message: format!("Search failed: {}", e).into(),
+                data: None,
+            })?;
+
+        // Format results as JSON
+        let results_json: Vec<_> = results.iter().map(|sym| {
+            json!({
+                "name": sym.name,
+                "kind": format!("{:?}", sym.kind),
+                "file_path": sym.file_path,
+                "start_line": sym.start_line,
+                "end_line": sym.end_line,
+                "documentation": sym.documentation,
+            })
+        }).collect();
+
+        let summary = format!(
+            "Found {} symbol(s) matching '{}' (mode: {:?}, library: {}, types_only: {})",
+            results.len(),
+            params.name,
+            mode,
+            options.include_library,
+            options.types_only
+        );
+
+        Ok(CallToolResult::success(vec![
+            Content::text(summary),
+            Content::text(serde_json::to_string_pretty(&results_json).unwrap()),
+        ]))
     }
 
     /// List all symbols defined in a specific file
@@ -67,7 +152,9 @@ impl ServerHandler for CratographerServer {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the server instance and start serving
-    let service = CratographerServer::new().serve(stdio()).await?;
+    // This will fail if the project cannot be loaded
+    let server = CratographerServer::new()?;
+    let service = server.serve(stdio()).await?;
 
     // Wait for shutdown
     service.waiting().await?;
@@ -81,10 +168,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_symbol_returns_ok() {
-        let server = CratographerServer::new();
-        let result = server.find_symbol().await;
+        let server = CratographerServer::new().expect("Failed to create server");
 
-        assert!(result.is_ok(), "find_symbol should return Ok");
+        // Create parameters to search for "Analyzer"
+        let params = Parameters(FindSymbolParams {
+            name: "Analyzer".to_string(),
+            mode: Some("fuzzy".to_string()),
+            include_library: Some(false),
+            types_only: Some(false),
+        });
+
+        let result = server.find_symbol(params).await;
+
+        assert!(result.is_ok(), "find_symbol should return Ok: {:?}", result.err());
         let tool_result = result.unwrap();
 
         // Check that we got content back
@@ -92,11 +188,57 @@ mod tests {
 
         // Verify it's a success result (not an error)
         assert!(!tool_result.is_error.unwrap_or(false), "Result should not be an error");
+
+        // Just print the debug output
+        println!("Result: {:?}", tool_result.content);
+    }
+
+    #[tokio::test]
+    async fn test_find_symbol_exact_search() {
+        let server = CratographerServer::new().expect("Failed to create server");
+
+        // Exact search for "Analyzer"
+        let params = Parameters(FindSymbolParams {
+            name: "Analyzer".to_string(),
+            mode: Some("exact".to_string()),
+            include_library: Some(false),
+            types_only: Some(false),
+        });
+
+        let result = server.find_symbol(params).await;
+        assert!(result.is_ok(), "find_symbol should return Ok");
+
+        let tool_result = result.unwrap();
+        let content_str = format!("{:?}", tool_result.content);
+        println!("Exact search result: {}", content_str);
+
+        // Verify the search mode is Exact in the output
+        assert!(content_str.contains("mode: Exact"), "Should use Exact search mode");
+    }
+
+    #[tokio::test]
+    async fn test_find_symbol_with_library() {
+        let server = CratographerServer::new().expect("Failed to create server");
+
+        // Search for HashMap with library symbols
+        let params = Parameters(FindSymbolParams {
+            name: "HashMap".to_string(),
+            mode: Some("exact".to_string()),
+            include_library: Some(true),
+            types_only: Some(false),
+        });
+
+        let result = server.find_symbol(params).await;
+        assert!(result.is_ok(), "find_symbol should return Ok");
+
+        // Should find HashMap from the standard library
+        let content_str = format!("{:?}", result.unwrap().content);
+        assert!(content_str.contains("HashMap"), "Should find HashMap");
     }
 
     #[tokio::test]
     async fn test_enumerate_file_returns_ok() {
-        let server = CratographerServer::new();
+        let server = CratographerServer::new().expect("Failed to create server");
         let result = server.enumerate_file().await;
 
         assert!(result.is_ok(), "enumerate_file should return Ok");
@@ -111,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_server_info() {
-        let server = CratographerServer::new();
+        let server = CratographerServer::new().expect("Failed to create server");
         let info = server.get_info();
 
         // Verify server name and version
@@ -149,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_server_creation() {
-        let _server = CratographerServer::new();
+        let _server = CratographerServer::new().expect("Failed to create server");
         // Just verify we can create the server without panicking
         // If we get here, the server was created successfully
     }
