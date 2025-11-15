@@ -385,4 +385,138 @@ mod tests {
             println!("Found AnalyzerServer: {:?}", sym);
         }
     }
+
+    #[test]
+    fn test_exact_search_vs_prefix() {
+        let mut analyzer = Analyzer::new();
+
+        // Load the current project
+        let result = analyzer.load_project(".");
+        assert!(result.is_ok(), "Failed to load project: {:?}", result.err());
+
+        // Test exact search - should find only "Analyzer", not "AnalyzerError"
+        let exact_options = SearchOptions {
+            mode: SearchMode::Exact,
+            include_library: false,
+            types_only: false,
+        };
+        let exact_results = analyzer.find_symbol("Analyzer", &exact_options);
+        assert!(exact_results.is_ok(), "Exact search failed: {:?}", exact_results.err());
+
+        let exact_symbols = exact_results.unwrap();
+        println!("Exact search found {} symbols", exact_symbols.len());
+        for sym in &exact_symbols {
+            println!("  - {}: {:?}", sym.name, sym.kind);
+        }
+
+        // Exact search may find both "Analyzer" struct and "analyzer" module (case-insensitive)
+        // Let's verify we find the Analyzer struct specifically
+        let analyzer_struct = exact_symbols.iter().find(|s| {
+            s.name == "Analyzer" && matches!(s.kind, SymbolKind::Struct)
+        });
+        assert!(
+            analyzer_struct.is_some(),
+            "Exact search should find the Analyzer struct"
+        );
+
+        // Should NOT find AnalyzerError with exact search
+        let has_analyzer_error = exact_symbols.iter().any(|s| s.name == "AnalyzerError");
+        assert!(
+            !has_analyzer_error,
+            "Exact search should not find AnalyzerError"
+        );
+
+        // Test prefix search - should find both "Analyzer" and "AnalyzerError"
+        let prefix_options = SearchOptions {
+            mode: SearchMode::Prefix,
+            include_library: false,
+            types_only: false,
+        };
+        let prefix_results = analyzer.find_symbol("Analyzer", &prefix_options);
+        assert!(prefix_results.is_ok(), "Prefix search failed: {:?}", prefix_results.err());
+
+        let prefix_symbols = prefix_results.unwrap();
+        println!("Prefix search found {} symbols", prefix_symbols.len());
+        for sym in &prefix_symbols {
+            println!("  - {}: {:?}", sym.name, sym.kind);
+        }
+
+        // Should find at least 2 results (Analyzer and AnalyzerError, possibly also analyzer module)
+        assert!(
+            prefix_symbols.len() >= 2,
+            "Prefix search should find at least 2 results, found {}: {:?}",
+            prefix_symbols.len(),
+            prefix_symbols
+        );
+
+        // Verify we find both Analyzer and AnalyzerError
+        let has_analyzer = prefix_symbols.iter().any(|s| {
+            s.name == "Analyzer" && matches!(s.kind, SymbolKind::Struct)
+        });
+        let has_analyzer_error = prefix_symbols.iter().any(|s| {
+            s.name == "AnalyzerError" && matches!(s.kind, SymbolKind::Enum)
+        });
+
+        assert!(has_analyzer, "Prefix search should find Analyzer struct");
+        assert!(has_analyzer_error, "Prefix search should find AnalyzerError enum");
+    }
+
+    #[test]
+    fn test_search_with_library_dependencies() {
+        let mut analyzer = Analyzer::new();
+
+        // Load the current project
+        let result = analyzer.load_project(".");
+        assert!(result.is_ok(), "Failed to load project: {:?}", result.err());
+
+        // Search for HashMap without including libraries
+        let no_lib_options = SearchOptions {
+            mode: SearchMode::Exact,
+            include_library: false,
+            types_only: false,
+        };
+        let no_lib_results = analyzer.find_symbol("HashMap", &no_lib_options);
+        assert!(no_lib_results.is_ok(), "Search without library failed: {:?}", no_lib_results.err());
+
+        let no_lib_symbols = no_lib_results.unwrap();
+        println!("Search without library found {} HashMap symbols", no_lib_symbols.len());
+
+        // Search for HashMap with libraries included
+        let with_lib_options = SearchOptions {
+            mode: SearchMode::Exact,
+            include_library: true,
+            types_only: false,
+        };
+        let with_lib_results = analyzer.find_symbol("HashMap", &with_lib_options);
+        assert!(with_lib_results.is_ok(), "Search with library failed: {:?}", with_lib_results.err());
+
+        let with_lib_symbols = with_lib_results.unwrap();
+        println!("Search with library found {} HashMap symbols", with_lib_symbols.len());
+        for sym in with_lib_symbols.iter().take(5) {
+            println!("  - {} at {}", sym.name, sym.file_path);
+        }
+
+        // Should find HashMap from std library when including libraries
+        assert!(
+            with_lib_symbols.len() > no_lib_symbols.len(),
+            "Including libraries should find more symbols. Without lib: {}, with lib: {}",
+            no_lib_symbols.len(),
+            with_lib_symbols.len()
+        );
+
+        // Should find at least one HashMap (from std::collections)
+        assert!(
+            with_lib_symbols.len() > 0,
+            "Should find HashMap in standard library"
+        );
+
+        // Verify at least one is from std/core
+        let has_std_hashmap = with_lib_symbols.iter().any(|s| {
+            s.file_path.contains("std") || s.file_path.contains("hashbrown") || s.file_path.contains("collections")
+        });
+        assert!(
+            has_std_hashmap,
+            "Should find HashMap from standard library or hashbrown crate"
+        );
+    }
 }
