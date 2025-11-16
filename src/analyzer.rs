@@ -521,4 +521,75 @@ mod tests {
             "Should find HashMap from standard library or hashbrown crate"
         );
     }
+
+    #[test]
+    fn test_enumerate_analyzer_file() {
+        let mut analyzer = Analyzer::new();
+
+        // Load the current project
+        let result = analyzer.load_project(".");
+        assert!(result.is_ok(), "Failed to load project: {:?}", result.err());
+
+        // Get the absolute path to analyzer.rs
+        let analyzer_path = std::env::current_dir()
+            .expect("Failed to get current directory")
+            .join("src/analyzer.rs")
+            .canonicalize()
+            .expect("Failed to canonicalize analyzer.rs path");
+
+        // Enumerate symbols in analyzer.rs
+        let symbols = analyzer.enumerate_file(analyzer_path.to_str().unwrap());
+        assert!(symbols.is_ok(), "Failed to enumerate analyzer.rs: {:?}", symbols.err());
+
+        let symbols = symbols.unwrap();
+        println!("Found {} symbols in analyzer.rs", symbols.len());
+        for sym in &symbols {
+            println!("  - {} ({:?}) at lines {}-{}", sym.name, sym.kind, sym.start_line, sym.end_line);
+        }
+
+        // Verify we found expected structs/enums by name
+        let expected_types = ["SearchMode", "SearchOptions", "Analyzer", "AnalyzerError", "SymbolInfo", "SymbolKind"];
+        for expected in &expected_types {
+            let found = symbols.iter().any(|s| s.name == *expected);
+            assert!(
+                found,
+                "Should find {} in analyzer.rs. Found symbols: {:?}",
+                expected,
+                symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+        }
+
+        // Verify we found expected methods/functions by name
+        let expected_methods = ["find_symbol", "enumerate_file", "load_project", "new"];
+        for expected in &expected_methods {
+            let found = symbols.iter().any(|s| s.name == *expected);
+            assert!(
+                found,
+                "Should find {} method/function in analyzer.rs",
+                expected
+            );
+        }
+
+        // Verify we found the convert_symbol_kind function
+        let has_convert_fn = symbols.iter().any(|s| s.name == "convert_symbol_kind");
+        assert!(has_convert_fn, "Should find convert_symbol_kind function");
+
+        // Verify we found enum variants
+        let expected_variants = ["Exact", "Fuzzy", "Prefix"];
+        for expected in &expected_variants {
+            let found = symbols.iter().any(|s| s.name == *expected);
+            assert!(
+                found,
+                "Should find {} enum variant in analyzer.rs",
+                expected
+            );
+        }
+
+        // Verify we have a reasonable number of symbols
+        assert!(
+            symbols.len() > 10,
+            "Should find more than 10 symbols in analyzer.rs, found {}",
+            symbols.len()
+        );
+    }
 }
