@@ -161,10 +161,13 @@ impl Analyzer {
         let symbols = analysis.symbol_search(query, 1000)
             .map_err(|_| AnalyzerError::Canceled)?;
 
-        // Convert to our SymbolInfo type
+        // Convert to our SymbolInfo type, filtering by symbol kind
         let results = symbols
             .into_iter()
-            .map(|nav| {
+            .filter_map(|nav| {
+                // Filter to only include symbol kinds we care about
+                let kind = convert_symbol_kind(nav.kind.unwrap_or(RaSymbolKind::Module))?;
+
                 let file_id = nav.file_id;
                 let range = nav.full_range;
 
@@ -187,14 +190,14 @@ impl Analyzer {
                 // Extract documentation
                 let documentation = nav.docs.as_ref().map(|d| d.as_str().to_string());
 
-                SymbolInfo {
+                Some(SymbolInfo {
                     name: nav.name.to_string(),
-                    kind: convert_symbol_kind(nav.kind.unwrap_or(RaSymbolKind::Module)),
+                    kind,
                     file_path: path_str,
                     start_line,
                     end_line,
                     documentation,
-                }
+                })
             })
             .collect();
 
@@ -224,23 +227,26 @@ impl Analyzer {
         let text = analysis.file_text(file_id).map_err(|_| AnalyzerError::Canceled)?;
         let line_index = ra_ap_ide::LineIndex::new(&text);
 
-        // Convert to our SymbolInfo type
+        // Convert to our SymbolInfo type, filtering based on SymbolKind
         let results = structure
             .into_iter()
             .filter_map(|node| {
                 // Only process nodes that have a SymbolKind
                 // Skip ExternBlock and Region variants
-                if let ra_ap_ide::StructureNodeKind::SymbolKind(kind) = node.kind {
-                    let start = line_index.line_col(node.node_range.start());
-                    let end = line_index.line_col(node.node_range.end());
+                if let ra_ap_ide::StructureNodeKind::SymbolKind(ra_kind) = node.kind {
+                    // convert_symbol_kind filters to only include the symbol kinds we care about
+                    convert_symbol_kind(ra_kind).map(|kind| {
+                        let start = line_index.line_col(node.node_range.start());
+                        let end = line_index.line_col(node.node_range.end());
 
-                    Some(SymbolInfo {
-                        name: node.label.clone(),
-                        kind: convert_symbol_kind(kind),
-                        file_path: file_path.to_string(),
-                        start_line: start.line,
-                        end_line: end.line,
-                        documentation: node.detail.clone(),
+                        SymbolInfo {
+                            name: node.label.clone(),
+                            kind,
+                            file_path: file_path.to_string(),
+                            start_line: start.line,
+                            end_line: end.line,
+                            documentation: node.detail.clone(),
+                        }
                     })
                 } else {
                     None
@@ -259,37 +265,20 @@ impl Default for Analyzer {
 }
 
 /// Convert rust-analyzer's SymbolKind to our SymbolKind
-fn convert_symbol_kind(kind: RaSymbolKind) -> SymbolKind {
+/// Returns None for symbol kinds we don't care about
+fn convert_symbol_kind(kind: RaSymbolKind) -> Option<SymbolKind> {
     match kind {
-        RaSymbolKind::Attribute => SymbolKind::Attribute,
-        RaSymbolKind::BuiltinAttr => SymbolKind::BuiltinAttr,
-        RaSymbolKind::Const => SymbolKind::Const,
-        RaSymbolKind::ConstParam => SymbolKind::ConstParam,
-        RaSymbolKind::Derive => SymbolKind::Derive,
-        RaSymbolKind::DeriveHelper => SymbolKind::DeriveHelper,
-        RaSymbolKind::Enum => SymbolKind::Enum,
-        RaSymbolKind::Field => SymbolKind::Field,
-        RaSymbolKind::Function => SymbolKind::Function,
-        RaSymbolKind::Impl => SymbolKind::Impl,
-        RaSymbolKind::InlineAsmRegOrRegClass => SymbolKind::InlineAsmRegOrRegClass,
-        RaSymbolKind::Label => SymbolKind::Label,
-        RaSymbolKind::LifetimeParam => SymbolKind::LifetimeParam,
-        RaSymbolKind::Local => SymbolKind::Local,
-        RaSymbolKind::Macro => SymbolKind::Macro,
-        RaSymbolKind::Method => SymbolKind::Method,
-        RaSymbolKind::Module => SymbolKind::Module,
-        RaSymbolKind::ProcMacro => SymbolKind::ProcMacro,
-        RaSymbolKind::SelfParam => SymbolKind::SelfParam,
-        RaSymbolKind::SelfType => SymbolKind::SelfType,
-        RaSymbolKind::Static => SymbolKind::Static,
-        RaSymbolKind::Struct => SymbolKind::Struct,
-        RaSymbolKind::ToolModule => SymbolKind::ToolModule,
-        RaSymbolKind::Trait => SymbolKind::Trait,
-        RaSymbolKind::TypeAlias => SymbolKind::TypeAlias,
-        RaSymbolKind::TypeParam => SymbolKind::TypeParam,
-        RaSymbolKind::Union => SymbolKind::Union,
-        RaSymbolKind::ValueParam => SymbolKind::ValueParam,
-        RaSymbolKind::Variant => SymbolKind::Variant,
+        RaSymbolKind::Const => Some(SymbolKind::Const),
+        RaSymbolKind::Enum => Some(SymbolKind::Enum),
+        RaSymbolKind::Function => Some(SymbolKind::Function),
+        RaSymbolKind::Impl => Some(SymbolKind::Impl),
+        RaSymbolKind::Method => Some(SymbolKind::Method),
+        RaSymbolKind::Module => Some(SymbolKind::Module),
+        RaSymbolKind::Static => Some(SymbolKind::Static),
+        RaSymbolKind::Struct => Some(SymbolKind::Struct),
+        RaSymbolKind::Trait => Some(SymbolKind::Trait),
+        RaSymbolKind::TypeAlias => Some(SymbolKind::TypeAlias),
+        _ => None,
     }
 }
 
@@ -304,38 +293,19 @@ pub struct SymbolInfo {
     pub documentation: Option<String>,
 }
 
-/// Kind of symbol - mirrors rust-analyzer's SymbolKind
+/// Kind of symbol - only includes symbol kinds we care about
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
-    Attribute,
-    BuiltinAttr,
     Const,
-    ConstParam,
-    Derive,
-    DeriveHelper,
     Enum,
-    Field,
     Function,
     Impl,
-    InlineAsmRegOrRegClass,
-    Label,
-    LifetimeParam,
-    Local,
-    Macro,
     Method,
     Module,
-    ProcMacro,
-    SelfParam,
-    SelfType,
     Static,
     Struct,
-    ToolModule,
     Trait,
     TypeAlias,
-    TypeParam,
-    Union,
-    ValueParam,
-    Variant,
 }
 
 
@@ -612,7 +582,7 @@ mod tests {
         }
 
         // Verify we found expected functions
-        let expected_functions = ["new", "convert_symbol_kind"];
+        let expected_functions = ["new", "convert_symbol_kind", "default"];
         for expected in &expected_functions {
             let found = symbols.iter().any(|s| {
                 s.name == *expected && s.kind == SymbolKind::Function
@@ -624,37 +594,8 @@ mod tests {
             );
         }
 
-        // Verify we found enum variants with correct kind
-        let expected_variants = ["Exact", "Fuzzy", "Prefix"];
-        for expected in &expected_variants {
-            let found = symbols.iter().any(|s| {
-                s.name == *expected && s.kind == SymbolKind::Variant
-            });
-            assert!(
-                found,
-                "Should find {} as Variant in analyzer.rs",
-                expected
-            );
-        }
-
-        // Verify we found fields with correct kind
-        let expected_fields = ["host", "vfs", "mode", "include_library"];
-        for expected in &expected_fields {
-            let found = symbols.iter().any(|s| {
-                s.name == *expected && s.kind == SymbolKind::Field
-            });
-            assert!(
-                found,
-                "Should find {} as Field in analyzer.rs",
-                expected
-            );
-        }
-
-        // Verify we have a reasonable number of symbols
-        assert!(
-            symbols.len() > 10,
-            "Should find more than 10 symbols in analyzer.rs, found {}",
-            symbols.len()
-        );
+        // Verify we found impl blocks
+        let has_impl = symbols.iter().any(|s| s.kind == SymbolKind::Impl);
+        assert!(has_impl, "Should find at least one Impl block in analyzer.rs");
     }
 }
