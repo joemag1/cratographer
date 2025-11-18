@@ -56,6 +56,17 @@ impl CratographerServer {
         // Fail initialization if project loading fails
         analyzer.load_project(".")?;
 
+        // Perform a warm-up query to force everything to load
+        // This helps ensure the analyzer is fully initialized and caches are populated
+        let warmup_options = SearchOptions {
+            mode: SearchMode::Exact,
+            include_library: true,
+            types_only: false,
+        };
+        if let Err(e) = analyzer.find_symbol("HashMap", &warmup_options) {
+            eprintln!("Warning: Warm-up query failed: {}", e);
+        }
+
         Ok(Self {
             tool_router: Self::tool_router(),
             analyzer: Arc::new(Mutex::new(analyzer)),
