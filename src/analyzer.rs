@@ -157,8 +157,8 @@ impl Analyzer {
         }
 
         // Use symbol_search to find all symbols matching the name
-        // Limit to 1000 results
-        let symbols = analysis.symbol_search(query, 1000)
+        // Limit to 32 results
+        let symbols = analysis.symbol_search(query, 32)
             .map_err(|_| AnalyzerError::Canceled)?;
 
         // Convert to our SymbolInfo type, filtering by symbol kind
