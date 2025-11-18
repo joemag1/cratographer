@@ -219,7 +219,7 @@ impl Analyzer {
 
         // Use file_structure to get all symbols in the file
         let config = ra_ap_ide::FileStructureConfig {
-            exclude_locals: false,
+            exclude_locals: true,
         };
         let structure = analysis.file_structure(&config, file_id).map_err(|_| AnalyzerError::Canceled)?;
 
