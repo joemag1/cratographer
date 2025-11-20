@@ -74,7 +74,8 @@ impl CratographerServer {
     }
 
     /// Find all occurrences of a symbol by name across the indexed codebase
-    #[tool(description = "Find all occurrences of a Rust symbol (struct, enum, trait, function, method) by name")]
+    #[tool(description = "Find all occurrences of a Rust symbol (struct, enum, trait, function, method) by name. \
+            Searches both project and library files. Can apply sybmol filter: all, types, functions, or implementations.")]
     async fn find_symbol(&self, params: Parameters<FindSymbolParams>) -> Result<CallToolResult, McpError> {
         let params = params.0;
 
