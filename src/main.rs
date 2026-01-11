@@ -97,7 +97,7 @@ impl CratographerServer {
 
         // Load the current directory as the project
         // Fail initialization if project loading fails
-        analyzer.load_project(".")?;
+        let receiver = analyzer.load_project(".")?;
 
         // Perform a warm-up query to force everything to load
         // This helps ensure the analyzer is fully initialized and caches are populated
@@ -112,19 +112,10 @@ impl CratographerServer {
 
         let analyzer = Arc::new(Mutex::new(analyzer));
 
-        // Extract receiver and spawn file watcher task
-        let receiver = {
-            let mut analyzer_guard = analyzer.lock().unwrap();
-            analyzer_guard.take_receiver()
-        };
-
-        if let Some(receiver) = receiver {
-            match spawn_file_watcher(analyzer.clone(), receiver) {
-                Ok(_) => eprintln!("File watcher initialized"),
-                Err(e) => eprintln!("Warning: Could not start file watcher: {}", e),
-            }
-        } else {
-            eprintln!("Warning: File watcher not available");
+        // Spawn file watcher task with the receiver
+        match spawn_file_watcher(analyzer.clone(), receiver) {
+            Ok(_) => eprintln!("File watcher initialized"),
+            Err(e) => eprintln!("Warning: Could not start file watcher: {}", e),
         }
 
         Ok(Self {

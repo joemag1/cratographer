@@ -89,7 +89,6 @@ pub struct Analyzer {
     host: AnalysisHost,
     vfs: ra_ap_vfs::Vfs,
     loader: Option<ra_ap_vfs_notify::NotifyHandle>,
-    receiver: Option<crossbeam_channel::Receiver<ra_ap_vfs::loader::Message>>,
 }
 
 impl Analyzer {
@@ -99,7 +98,6 @@ impl Analyzer {
             host: AnalysisHost::new(None), // No LRU capacity limit
             vfs: ra_ap_vfs::Vfs::default(),
             loader: None,
-            receiver: None,
         }
     }
 
@@ -110,7 +108,9 @@ impl Analyzer {
     /// 2. Load the project workspace
     /// 3. Set up the analysis database with VFS and CrateGraph
     /// 4. Enable file watching for incremental updates
-    pub fn load_project(&mut self, project_path: impl Into<PathBuf>) -> Result<(), AnalyzerError> {
+    ///
+    /// Returns a receiver channel for file change notifications
+    pub fn load_project(&mut self, project_path: impl Into<PathBuf>) -> Result<crossbeam_channel::Receiver<ra_ap_vfs::loader::Message>, AnalyzerError> {
         use crossbeam_channel::unbounded;
         use ra_ap_ide_db::{ChangeWithProcMacros, RootDatabase};
         use ra_ap_load_cargo::ProjectFolders;
@@ -213,11 +213,10 @@ impl Analyzer {
         // Create AnalysisHost from the loaded database
         self.host = AnalysisHost::with_database(db);
 
-        // Store loader and receiver for future file watching
+        // Store loader for future file watching
         self.loader = Some(loader);
-        self.receiver = Some(receiver);
 
-        Ok(())
+        Ok(receiver)
     }
 
     /// Find all occurrences of a symbol by name
@@ -411,13 +410,6 @@ impl Analyzer {
         self.host.apply_change(analysis_change);
 
         Ok(())
-    }
-
-    /// Take the receiver channel (called once during initialization)
-    ///
-    /// This extracts the receiver so it can be used by the background watcher task.
-    pub fn take_receiver(&mut self) -> Option<crossbeam_channel::Receiver<ra_ap_vfs::loader::Message>> {
-        self.receiver.take()
     }
 }
 
