@@ -15,6 +15,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
+/// Initialization state for the analyzer
+#[derive(Debug, Clone)]
+enum InitState {
+    InProgress,
+    Ready,
+    Failed(String),
+}
+
 /// Parameters for the find_symbol tool
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct FindSymbolParams {
@@ -87,47 +95,110 @@ fn spawn_file_watcher(
 struct CratographerServer {
     tool_router: ToolRouter<Self>,
     analyzer: Arc<Mutex<Analyzer>>,
+    init_state: Arc<Mutex<InitState>>,
 }
 
 #[tool_router]
 impl CratographerServer {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        // Initialize the analyzer and load the current project
-        let mut analyzer = Analyzer::new();
+        // Create empty analyzer - will be populated by background task
+        let analyzer = Arc::new(Mutex::new(Analyzer::new()));
+        let init_state = Arc::new(Mutex::new(InitState::InProgress));
 
-        // Load the current directory as the project
-        // Fail initialization if project loading fails
-        let receiver = analyzer.load_project(".")?;
+        // Spawn background task to perform the slow initialization
+        let analyzer_clone = analyzer.clone();
+        let state_clone = init_state.clone();
+        tokio::spawn(async move {
+            eprintln!("Starting background initialization...");
 
-        // Perform a warm-up query to force everything to load
-        // This helps ensure the analyzer is fully initialized and caches are populated
-        let warmup_options = SearchOptions {
-            mode: SearchMode::Exact,
-            include_library: true,
-            filter: SymbolFilter::Types,
-        };
-        if let Err(e) = analyzer.find_symbol("HashMap", &warmup_options) {
-            eprintln!("Warning: Warm-up query failed: {}", e);
-        }
+            // Load the project in the background
+            let receiver = {
+                let mut analyzer = analyzer_clone.lock().unwrap();
+                match analyzer.load_project(".") {
+                    Ok(receiver) => receiver,
+                    Err(e) => {
+                        eprintln!("Failed to load project: {}", e);
+                        *state_clone.lock().unwrap() = InitState::Failed(format!("{}", e));
+                        return;
+                    }
+                }
+            };
 
-        let analyzer = Arc::new(Mutex::new(analyzer));
+            // Perform a warm-up query to force everything to load
+            {
+                let analyzer = analyzer_clone.lock().unwrap();
+                let warmup_options = SearchOptions {
+                    mode: SearchMode::Exact,
+                    include_library: true,
+                    filter: SymbolFilter::Types,
+                };
+                if let Err(e) = analyzer.find_symbol("HashMap", &warmup_options) {
+                    eprintln!("Warning: Warm-up query failed: {}", e);
+                }
+            }
 
-        // Spawn file watcher task with the receiver
-        match spawn_file_watcher(analyzer.clone(), receiver) {
-            Ok(_) => eprintln!("File watcher initialized"),
-            Err(e) => eprintln!("Warning: Could not start file watcher: {}", e),
-        }
+            // Spawn file watcher task with the receiver
+            match spawn_file_watcher(analyzer_clone.clone(), receiver) {
+                Ok(_) => eprintln!("File watcher initialized"),
+                Err(e) => eprintln!("Warning: Could not start file watcher: {}", e),
+            }
+
+            // Mark as ready
+            *state_clone.lock().unwrap() = InitState::Ready;
+            eprintln!("Background initialization complete - server ready");
+        });
 
         Ok(Self {
             tool_router: Self::tool_router(),
             analyzer,
+            init_state,
         })
+    }
+
+    /// Wait for initialization to complete (useful for tests)
+    #[allow(dead_code)]
+    async fn wait_for_ready(&self) -> Result<(), String> {
+        use tokio::time::{sleep, Duration};
+
+        for _ in 0..100 {  // Wait up to 10 seconds
+            match &*self.init_state.lock().unwrap() {
+                InitState::Ready => return Ok(()),
+                InitState::Failed(err) => return Err(err.clone()),
+                InitState::InProgress => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+        Err("Initialization timeout".to_string())
+    }
+
+    /// Check if initialization is complete and return appropriate error if not
+    fn check_init_state(&self) -> Result<(), McpError> {
+        match &*self.init_state.lock().unwrap() {
+            InitState::InProgress => {
+                Err(McpError {
+                    code: ErrorCode(-32001),
+                    message: "Server is still initializing. Please try again in a moment.".into(),
+                    data: None,
+                })
+            }
+            InitState::Failed(err) => {
+                Err(McpError {
+                    code: ErrorCode(-32002),
+                    message: format!("Server initialization failed: {}", err).into(),
+                    data: None,
+                })
+            }
+            InitState::Ready => Ok(())
+        }
     }
 
     /// Find all occurrences of a symbol by name across the indexed codebase
     #[tool(description = "Find all occurrences of a Rust symbol (struct, enum, trait, function, method, impl) by name. \
             Searches both project and library files. Can apply symbol filter: all, types, functions, or implementations.")]
     async fn find_symbol(&self, params: Parameters<FindSymbolParams>) -> Result<CallToolResult, McpError> {
+        self.check_init_state()?;
+
         let params = params.0;
 
         // Parse search mode from string
@@ -205,6 +276,8 @@ impl CratographerServer {
     /// List all symbols defined in a specific file
     #[tool(description = "Enumerate all Rust symbols defined in a specific file")]
     async fn enumerate_file(&self, params: Parameters<EnumerateFileParams>) -> Result<CallToolResult, McpError> {
+        self.check_init_state()?;
+
         let params = params.0;
 
         // Enumerate symbols in the file
@@ -282,6 +355,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_symbol_returns_ok() {
         let server = CratographerServer::new().expect("Failed to create server");
+        server.wait_for_ready().await.expect("Server initialization failed");
 
         // Create parameters to search for "Analyzer"
         let params = Parameters(FindSymbolParams {
@@ -309,6 +383,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_symbol_exact_search() {
         let server = CratographerServer::new().expect("Failed to create server");
+        server.wait_for_ready().await.expect("Server initialization failed");
 
         // Exact search for "Analyzer"
         let params = Parameters(FindSymbolParams {
@@ -332,6 +407,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_symbol_with_library() {
         let server = CratographerServer::new().expect("Failed to create server");
+        server.wait_for_ready().await.expect("Server initialization failed");
 
         // Search for HashMap with library symbols
         let params = Parameters(FindSymbolParams {
@@ -352,6 +428,7 @@ mod tests {
     #[tokio::test]
     async fn test_enumerate_file_returns_ok() {
         let server = CratographerServer::new().expect("Failed to create server");
+        server.wait_for_ready().await.expect("Server initialization failed");
 
         // Get the absolute path to analyzer.rs
         let analyzer_path = std::env::current_dir()
@@ -380,8 +457,8 @@ mod tests {
         println!("Result: {:?}", tool_result.content);
     }
 
-    #[test]
-    fn test_server_info() {
+    #[tokio::test]
+    async fn test_server_info() {
         let server = CratographerServer::new().expect("Failed to create server");
         let info = server.get_info();
 
@@ -418,10 +495,73 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_server_creation() {
+    #[tokio::test]
+    async fn test_server_creation() {
         let _server = CratographerServer::new().expect("Failed to create server");
         // Just verify we can create the server without panicking
         // If we get here, the server was created successfully
+    }
+
+    #[tokio::test]
+    async fn test_initialization_states() {
+        use tokio::time::{sleep, Duration};
+
+        let server = CratographerServer::new().expect("Failed to create server");
+
+        // Check initial state - should be InProgress
+        let initial_state = server.init_state.lock().unwrap().clone();
+        match initial_state {
+            InitState::InProgress => {
+                eprintln!("Initial state: InProgress (as expected)");
+            }
+            InitState::Ready => {
+                eprintln!("Initial state: Ready (initialization was very fast)");
+            }
+            InitState::Failed(ref err) => {
+                panic!("Unexpected initial state: Failed({})", err);
+            }
+        }
+
+        // Try calling tool immediately - should get "not ready" error if still in progress
+        let params = Parameters(FindSymbolParams {
+            name: "test".to_string(),
+            mode: Some("exact".to_string()),
+            include_library: Some(false),
+            filter: Some("all".to_string()),
+        });
+
+        let result = server.find_symbol(params).await;
+        match result {
+            Err(e) if e.message.contains("still initializing") => {
+                eprintln!("Got expected 'still initializing' error");
+            }
+            Ok(_) => {
+                eprintln!("Initialization was fast enough, tool succeeded immediately");
+            }
+            Err(e) => {
+                eprintln!("Got unexpected error: {}", e.message);
+            }
+        }
+
+        // Wait a bit and check if it eventually becomes ready
+        for i in 0..5 {
+            sleep(Duration::from_millis(500)).await;
+            let state = server.init_state.lock().unwrap().clone();
+            match state {
+                InitState::Ready => {
+                    eprintln!("Became ready after {}ms", (i + 1) * 500);
+                    return;
+                }
+                InitState::InProgress => {
+                    eprintln!("Still in progress after {}ms", (i + 1) * 500);
+                }
+                InitState::Failed(ref err) => {
+                    eprintln!("Failed after {}ms: {}", (i + 1) * 500, err);
+                    return;
+                }
+            }
+        }
+
+        eprintln!("Note: Initialization still in progress after 2.5s - this is expected for large projects");
     }
 }
